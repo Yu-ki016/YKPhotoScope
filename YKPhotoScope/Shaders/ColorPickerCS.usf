@@ -1,0 +1,44 @@
+﻿#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+
+Texture2D OriginalSceneColor;
+
+// SceneColor Viewport parameters
+SCREEN_PASS_TEXTURE_VIEWPORT(SceneColorViewport)
+
+float2 ColorPicker_MouseUV;
+int  ColorPicker_Radius;
+
+RWTexture2D<float4> Output;
+
+
+[numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
+void MainCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	// Check that we are in scope
+	if (any(DispatchThreadId >= SceneColorViewport_ViewportMax))
+	{
+		return;
+	}
+	
+	float2 SampleUV = float2(SceneColorViewport_ViewportMin + (DispatchThreadId + 0.5)) * SceneColorViewport_ExtentInverse;
+
+	float4 SampleColor = OriginalSceneColor.SampleLevel(GlobalPointClampedSampler, SampleUV, 0);
+
+	if (ColorPicker_Radius > 0)
+	{
+		float2 MousePos = ColorPicker_MouseUV * SceneColorViewport_ViewportSize;
+		
+		float2 Diff = (DispatchThreadId + 0.5) - (MousePos + SceneColorViewport_ViewportMin);
+		float Dist = length(Diff);
+		if (int(Dist) == ColorPicker_Radius)
+		{
+			SampleColor.rgb = float3(1.0, 1.0, 1.0);
+		}
+	}
+	
+	// // Write output
+	Output[SceneColorViewport_ViewportMin + DispatchThreadId] = SampleColor;
+}

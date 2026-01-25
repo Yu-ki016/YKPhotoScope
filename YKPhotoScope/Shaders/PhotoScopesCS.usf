@@ -1,0 +1,266 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// -----------------------------Shader parameters------------------------------
+
+// SceneColor texture
+Texture2D OriginalSceneColor;
+
+// SceneColor Viewport parameters
+SCREEN_PASS_TEXTURE_VIEWPORT(SceneColorViewport)
+
+float2 ColorPicker_MouseUV;
+int  ColorPicker_Radius;
+
+RWTexture2D<uint> OutputR;
+RWTexture2D<uint> OutputG;
+RWTexture2D<uint> OutputB;
+
+// Scope settings
+float2 TextureSize;
+int ScopeMode;
+float MaxValue;
+// -----------------------------Shader parameters------------------------------
+
+float3 RGBtoYUV(float3 Color)
+{
+    float R = Color.r;
+    float G = Color.g;
+    float B = Color.b;
+    float Y = 0.2126f * R + 0.7152 * G + 0.0722 * B;
+    float U = -0.114572f * R - 0.385428f * G + 0.5 * B;
+    float V = 0.5f * R - 0.454153f * G - 0.045847f * B;
+    return float3(Y, U, V);
+}
+
+float2 GetVectorPos(float3 RGB, float2 RenderTargetSize)
+{
+    float3 YUV = RGBtoYUV(RGB);
+    return float2((YUV.g + 0.5f) * (RenderTargetSize.x - 1.0f),
+                  (0.5f - YUV.b) * (RenderTargetSize.y - 1.0f));
+}
+
+float LumaFromRGB(float3 Color)
+{
+    // ITU-R BT.709 colour luminance gradients
+    return 0.2126 * Color.r + 0.7152 * Color.g + 0.0722* Color.b;
+}
+
+#define ENERGY_SCALE 256
+
+#define SCOPEMODE_PARADE    0
+#define SCOPEMODE_WAVEFORM  1
+#define SCOPEMODE_VECTOR    2
+#define SCOPEMODE_HISTOGRAM 3
+
+void DrawParade(float3 ColorCenter, float3 ColorLeft, 
+    uint2 DispatchThreadId, float2 RenderTargetSize, float2 ScreenSize)
+{
+    float3 YC = (MaxValue - ColorCenter) / MaxValue;
+    YC = saturate(YC);
+    YC *= (RenderTargetSize.y - 1.0f);
+    float3 YL = (MaxValue -ColorLeft) / MaxValue;
+    YL = saturate(YL);
+    YL *= (RenderTargetSize.y - 1.0f);
+
+    float BaseEnergy = max((RenderTargetSize.y / ScreenSize.y) * ENERGY_SCALE, 1.0f);
+
+    // 分别写入 R, G, B通道
+    [unroll]
+    for(int c = 0; c < 3; ++c)
+    {
+        float YStart = min(YL[c], YC[c]);
+        float YEnd = max(YL[c], YC[c]);
+        float YCenter = YC[c]; 
+        
+        float TotalDist = max(YEnd - YStart, 1.0f); 
+        float DistRCP = 2.0f / TotalDist;
+        
+        int IStart = (int)floor(YStart);
+        int IEnd = (int)ceil(YEnd);
+    
+        float Sigma = 0.2f; 
+        float SumWeight = 0.0f;
+        for(int y = IStart; y <= IEnd; ++y)
+        {
+            float Dist = float(y) - YCenter;
+            Dist *= DistRCP;
+            SumWeight += exp(-(Dist * Dist) / (2.0f * Sigma));
+        }
+        
+        for(int y = IStart; y <= IEnd; ++y)
+        {
+            if (y >= 0 && y < (int)RenderTargetSize.y)
+            {
+                float Dist = float(y) - YCenter;
+                Dist *= DistRCP;
+                
+                float Weight = exp(-(Dist * Dist) / (2.0f * Sigma));
+                Weight /= SumWeight; // 归一化权重
+                
+                uint FinalEnergy = (uint)max(BaseEnergy * Weight, 0.0f);
+    
+                if (FinalEnergy > 0)
+                {
+                    uint2 WritePos = uint2(DispatchThreadId.x, y);
+                    if (c == 0)      InterlockedAdd(OutputR[WritePos], FinalEnergy);
+                    else if (c == 1) InterlockedAdd(OutputG[WritePos], FinalEnergy);
+                    else if (c == 2) InterlockedAdd(OutputB[WritePos], FinalEnergy);
+                }
+            }
+        }
+    }
+}
+
+void DrawVector(float3 ColorCenter, float3 ColorLeft, 
+    uint2 DispatchThreadId, float2 RenderTargetSize, float2 ScreenSize)
+{
+    float3 ColorCenterNormalized = ColorCenter / MaxValue;
+    float3 ColorLeftNormalized   = ColorLeft   / MaxValue;
+
+    float2 PosC = GetVectorPos(ColorCenterNormalized, RenderTargetSize);
+    float2 PosL = GetVectorPos(ColorLeftNormalized, RenderTargetSize);
+
+    float DeltaDist = length(PosC - PosL);
+    
+    const float MaxStep = 32.0f;
+    int Steps = (int)ceil(min(DeltaDist, MaxStep));
+    float StepRCP = 1.0f / (float)Steps;
+    
+    float BaseEnergy = max((RenderTargetSize.x * RenderTargetSize.y) / (ScreenSize.x * ScreenSize.y) * ENERGY_SCALE, 1.0f);
+
+    for (int i = 0; i < Steps; ++i)
+    {
+        float t = (float)i * StepRCP;
+
+        // 先在 RGB 空间做线性插值
+        float3 SampleRGB = lerp(ColorLeftNormalized, ColorCenterNormalized, t);
+        // 再将插值后的颜色映射到 YUV 坐标
+        float2 SamplePos = GetVectorPos(SampleRGB, RenderTargetSize);
+        
+        uint2 WritePos = (uint2)SamplePos;
+        if (WritePos.x < (uint)RenderTargetSize.x && WritePos.y < (uint)RenderTargetSize.y)
+        {
+            float Luminance = LumaFromRGB(SampleRGB);
+            float3 NormalizedColor = Luminance > 0.0001f ? SampleRGB / Luminance : 0.333f;
+            
+            uint3 FinalEnergy = (uint3)(NormalizedColor * BaseEnergy);
+            if (FinalEnergy.r > 0) InterlockedAdd(OutputR[WritePos], FinalEnergy.r);
+            if (FinalEnergy.g > 0) InterlockedAdd(OutputG[WritePos], FinalEnergy.g);
+            if (FinalEnergy.b > 0) InterlockedAdd(OutputB[WritePos], FinalEnergy.b);
+        }
+    }
+}
+
+void DrawHistogram(float3 ColorCenter, float3 ColorLeft, 
+    uint2 DispatchThreadId, float2 RenderTargetSize, float2 ScreenSize)
+{
+    float BaseEnergy = max((RenderTargetSize.x * 256.0f) / (ScreenSize.x * ScreenSize.y)  * ENERGY_SCALE, 1.0f);
+    uint FinalEnergy = uint(BaseEnergy);
+    
+    float3 MappedX = saturate(ColorCenter.rgb / MaxValue) * (RenderTargetSize.x - 1.0f);
+    uint2 WritePosR = uint2(MappedX.r, 0);
+    if (WritePosR.x < (uint)RenderTargetSize.x) InterlockedAdd(OutputR[WritePosR], FinalEnergy);
+    uint2 WritePosG = uint2(MappedX.g, 0);
+    if (WritePosG.x < (uint)RenderTargetSize.x) InterlockedAdd(OutputG[WritePosG], FinalEnergy);
+    uint2 WritePosB = uint2(MappedX.b, 0);
+    if (WritePosB.x < (uint)RenderTargetSize.x) InterlockedAdd(OutputB[WritePosB], FinalEnergy);
+}
+
+// [0]=RSum, [1]=GSum, [2]=BSum, [3]=PixelCount
+RWStructuredBuffer<uint> OutColorAccumBuffer; 
+
+// 拾色器范围逻辑提取为函数
+bool IsInColorPicker(float2 DispatchPos, float2 ViewportMin, float2 ViewportSize, float2 MouseUV, float Radius)
+{
+    if (Radius <= 0) return false;
+    float2 MousePosInViewport = MouseUV * ViewportSize;
+    float2 Diff = (DispatchPos + 0.5) - (ViewportMin + MousePosInViewport);
+    return length(Diff) <= Radius;
+}
+
+groupshared float3 SharedColors[THREADS_X + 1][THREADS_Y];
+[numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
+
+void MainCS(
+    uint2 DispatchThreadId : SV_DispatchThreadID,
+    uint2 GroupThreadId : SV_GroupThreadID,
+    uint2 GroupId : SV_GroupID)
+{
+
+    float2 InvSize = SceneColorViewport_ExtentInverse;
+    float2 UV = (SceneColorViewport_ViewportMin + float2(DispatchThreadId) + 0.5) * InvSize;
+
+    // 数据并行加载到共享内存
+    float3 SampleColor = float3(0, 0, 0);
+    if (all(DispatchThreadId < uint2(SceneColorViewport_ViewportMax)))
+    {
+        SampleColor = OriginalSceneColor.SampleLevel(GlobalPointClampedSampler, UV, 0).rgb;
+    }
+    SharedColors[GroupThreadId.x + 1][GroupThreadId.y] = SampleColor;
+
+    if (GroupThreadId.x == 0)
+        SharedColors[0][GroupThreadId.y] = OriginalSceneColor.SampleLevel(GlobalPointClampedSampler, UV - float2(InvSize.x, 0), 0).rgb;
+    
+    // 组内同步
+    GroupMemoryBarrierWithGroupSync();
+
+    if (any(DispatchThreadId >= uint2(SceneColorViewport_ViewportMax))) return;
+
+    // 从共享内存获取颜色
+    float3 ColorCenter = SharedColors[GroupThreadId.x + 1][GroupThreadId.y];
+    float3 ColorLeft   = SharedColors[GroupThreadId.x][GroupThreadId.y];
+    
+    float2 ScreenSize = SceneColorViewport_ViewportMax - SceneColorViewport_ViewportMin;
+    
+    // 拾色器统计拾色范围内颜色的累积值
+    if (IsInColorPicker((float2)DispatchThreadId, (float2)SceneColorViewport_ViewportMin, ScreenSize, ColorPicker_MouseUV, ColorPicker_Radius))
+    {
+        uint R = (uint)max(0, ColorCenter.r * 1000.0f);
+        uint G = (uint)max(0, ColorCenter.g * 1000.0f);
+        uint B = (uint)max(0, ColorCenter.b * 1000.0f);
+
+        InterlockedAdd(OutColorAccumBuffer[0], R);
+        InterlockedAdd(OutColorAccumBuffer[1], G);
+        InterlockedAdd(OutColorAccumBuffer[2], B);
+        InterlockedAdd(OutColorAccumBuffer[3], 1);
+    }
+    
+    // 示波器
+    [branch]
+    switch (ScopeMode)
+    {
+    case SCOPEMODE_PARADE:
+    case SCOPEMODE_WAVEFORM:
+        DrawParade(ColorCenter, ColorLeft, DispatchThreadId, TextureSize, ScreenSize);
+        return;
+    case SCOPEMODE_VECTOR:
+        DrawVector(ColorCenter, ColorLeft, DispatchThreadId, TextureSize, ScreenSize);
+        return;
+    case SCOPEMODE_HISTOGRAM:
+        DrawHistogram(ColorCenter, ColorLeft, DispatchThreadId, TextureSize, ScreenSize);
+        return;
+    default: ;
+    }
+}
+
+Texture2D<uint> AccumR;
+Texture2D<uint> AccumG;
+Texture2D<uint> AccumB;
+RWTexture2D<float4> OutFinalTarget;
+
+[numthreads(8, 8, 1)]
+void CombineRTCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (any(DispatchThreadId >= uint2(TextureSize))) return;
+
+    uint rRaw = AccumR[DispatchThreadId];
+    uint gRaw = AccumG[DispatchThreadId];
+    uint bRaw = AccumB[DispatchThreadId];
+
+    float3 FinalColor = float3(rRaw, gRaw, bRaw);
+    FinalColor /= float(ENERGY_SCALE);
+    
+    OutFinalTarget[DispatchThreadId] = float4(FinalColor, 1.0f);
+}

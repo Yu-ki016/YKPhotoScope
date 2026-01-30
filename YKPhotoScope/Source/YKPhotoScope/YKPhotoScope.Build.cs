@@ -1,5 +1,6 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+using System.IO;
 using UnrealBuildTool;
 
 public class YKPhotoScope : ModuleRules
@@ -10,6 +11,7 @@ public class YKPhotoScope : ModuleRules
 		
 		PublicIncludePaths.AddRange(
 			new string[] {
+				Path.Combine(GetModuleDirectory("Renderer"), "Internal"),
 				// ... add public include paths required here ...
 			}
 			);

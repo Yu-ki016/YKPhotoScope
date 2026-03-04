@@ -73,16 +73,25 @@ FScreenPassTexture FPhotoScopeSceneViewExtension::DrawScopesPostTonemap(FRDGBuil
 
 	FScreenPassRenderTarget OverrideOutput = Inputs.OverrideOutput;
 	
-	if (!ColorPickConfig.bEnable || !IsActiveViewport(SceneView))
-	{
-		FScreenPassTextureSlice& SceneColorSlice = const_cast<FScreenPassTextureSlice&>(Inputs.Textures[(uint32)EPostProcessMaterialInput::SceneColor]);
-		return FScreenPassTexture::CopyFromSlice(GraphBuilder, SceneColorSlice, static_cast<FScreenPassTexture>(OverrideOutput));
-	}
-	
 	if (!OverrideOutput.IsValid())
 	{
 		OverrideOutput = FScreenPassRenderTarget::CreateFromInput(GraphBuilder, SceneColor, SceneView.GetOverwriteLoadAction(), TEXT("PhotoScopeRenderTarget"));
 	}
+	
+	if (!ColorPickConfig.bEnable || !IsActiveViewport(SceneView))
+	{
+		FScreenPassTextureSlice& SceneColorSlice = const_cast<FScreenPassTextureSlice&>(Inputs.Textures[(uint32)EPostProcessMaterialInput::SceneColor]);
+		if (OverrideOutput.Texture->Desc.Format != SceneColorSlice.TextureSRV->GetParent()->Desc.Format)
+		{
+			AddDrawTexturePass(GraphBuilder, FScreenPassViewInfo(), SceneColorSlice, OverrideOutput);
+			return OverrideOutput;
+		}
+		else
+		{
+			return FScreenPassTexture::CopyFromSlice(GraphBuilder, SceneColorSlice, OverrideOutput);
+		}
+	}
+	
 	
 	const FSceneViewFamily& ViewFamily = *SceneView.Family;
 	const FScreenPassTextureViewport SceneColorViewport(SceneColor);

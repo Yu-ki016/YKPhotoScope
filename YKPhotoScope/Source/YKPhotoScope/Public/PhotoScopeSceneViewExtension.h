@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "RHIGPUReadback.h"
 #include "SceneViewExtension.h"
 #include "ScreenPass.h"
 
